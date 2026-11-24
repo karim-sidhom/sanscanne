@@ -38,7 +38,7 @@ L.control.layers({'🛰️ Satellite':fond,'🗺️ Plan':plan},null,{position:'
 /** Options passées à navigator.geolocation.watchPosition (index.html l.7118). */
 const GPS_WATCH_OPTIONS = Object.freeze({
   enableHighAccuracy: true,
-  maximumAge: 2000,
+  maximumAge: 0,   /* toujours une position fraîche (modifié : 2000 à l'origine) */
   timeout: 15000,
 });
 
@@ -439,7 +439,7 @@ window.GpsModel = {
   function loadUser(){ if(!me) return; var l=around(me.lat,me.lon,1); l.sort(function(a,b2){return a[2]-b2[2];}); runPool(l); }
   map.on('zoomend moveend',function(){ info(); if(visOn){ resize(); loadView(); } });
   setInterval(function(){ if(visOn) loadView(); if(on){ loadUser(); evalPos(); } info(); checkReady(); },6000);
-  setInterval(function(){ if(on){ evalPos(); stepsMsg(); info(); } },400);
+  setInterval(function(){ if(on){ evalPos(); stepsMsg(); info(); } },200);
   setTimeout(function(){ info(); loadView(); },800);
 
   /* ---------- position ---------- */
@@ -501,8 +501,8 @@ window.GpsModel = {
     if(signed(me.lat,me.lon)===null) return 'Rues non chargées';
     return '';
   }
-  /* position « maintenant » : centre des 3 lectures avancé à la vitesse de la personne (rattrape le retard de la moyenne et avance entre deux fixes, 2,5 s max) */
-  function pos(){ var dt=Math.min(2.5,Math.max(0,(Date.now()-me.tm)/1000)), K=111320;
+  /* position « maintenant » : centre des 3 lectures avancé à la vitesse de la personne (avance entre deux fixes, 1,2 s max) */
+  function pos(){ var dt=Math.min(1.2,Math.max(0,(Date.now()-me.tm)/1000)), K=111320;
     return {lat:me.lat+me.vy*dt/K, lon:me.lon+me.vx*dt/(K*Math.cos(me.lat*Math.PI/180))}; }
   /* ---------- nombre de pas avant l'autre zone, dans le sens de la marche ---------- */
   var STEP=0.7, lastN=-1, lastS='', lastT=0, stepTxt='';   /* STEP = longueur d'un pas en mètres (à régler selon la personne) */
@@ -535,7 +535,7 @@ window.GpsModel = {
     if(state==='red') raw= s<=0.6?'red' : 'green';
     else raw= s<=-0.3?'red' : 'green';
     var now=Date.now(); if(raw!==want){ want=raw; wantSince=now; }
-    if(raw===state||now-wantSince<(raw==='red'?400:1000)) return;
+    if(raw===state||now-wantSince<(raw==='red'?150:1000)) return;
     var ns=raw;
     if(ns==='green'&&state==='none') speak('Bord de rue',true);
     if(ns==='none'&&state!=='none') speak('Zone sûre',true);
