@@ -466,13 +466,10 @@ window.GpsModel = {
     rawAcc=fix.accuracy||99; rawT=Date.now(); gpsErr='';
     if(!me){ showMk(fix.lat,fix.lon,rawAcc); if(!first){ first=true; map.setView([fix.lat,fix.lon],Math.max(map.getZoom(),18)); } }   /* point bleu immédiat */
     var f={lat:fix.lat,lon:fix.lon,est:rawAcc};
-    /* 3 lectures GPS en 3 s : on confirme l'endroit et on utilise le CENTRE du cercle formé par les points */
-    var now=Date.now(); buf.push({lat:f.lat,lon:f.lon,t:now}); buf=buf.filter(function(q){ return now-q.t<=3500; }).slice(-3);
-    var n=buf.length; if(n<3&&me&&now-me.t<6000) return;      /* on attend la 3e lecture (sauf au démarrage ou si le GPS est lent) */
-    var cl=0,co=0,tm=0; buf.forEach(function(q){ cl+=q.lat; co+=q.lon; tm+=q.t; }); cl/=n; co/=n; tm/=n;
-    var rad=0; buf.forEach(function(q){ rad=Math.max(rad,ptDist(cl,co,q.lat,q.lon)); });
-    if(n>=3&&rad>Math.max(10,2*rawAcc)){ buf=buf.slice(-1); return; }      /* lectures qui ne concordent pas : position non confirmée */
-    var est=Math.max(rad,f.est||0);
+    /* position BRUTE (comme gps-model.js) : chaque lecture est utilisée telle quelle, sans moyenne ni attente */
+    var now=Date.now(); buf.push({lat:f.lat,lon:f.lon,t:now}); buf=buf.filter(function(q){ return now-q.t<=3500; }).slice(-3);   /* historique court : sert seulement à estimer la vitesse */
+    var n=buf.length, cl=fix.lat, co=fix.lon, tm=now;
+    var est=f.est||0;
     /* vitesse de la personne : GPS (vitesse + cap) si dispo, sinon déplacement entre la 1re et la dernière lecture */
     var K=111320, ck=Math.cos(cl*Math.PI/180), vx=0, vy=0, sp=fix.speedMps, hd=fix.heading;
     if(hd!==null&&sp>0){ vx=sp*Math.sin(hd*Math.PI/180); vy=sp*Math.cos(hd*Math.PI/180); }
