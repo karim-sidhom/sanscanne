@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>🦯 Alerte trottoir — carte rouge / verte</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+html,body{margin:0;height:100%;background:#0d1a6e;font-family:system-ui,sans-serif}
+#map{position:absolute;inset:0}
+#bar{position:absolute;top:calc(10px + env(safe-area-inset-top));right:calc(10px + env(safe-area-inset-right));z-index:1000;background:#0d1a6eE6;color:#fff;border:1px solid #d4af37;border-radius:14px;padding:8px 12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;max-width:calc(100vw - 40px);box-shadow:0 4px 16px rgba(0,0,0,.35)}
+#bar button{background:#d4af37;color:#0d1a6e;border:0;border-radius:6px;padding:6px 10px;font-size:18px;font-weight:700;cursor:pointer}
+#bar button:active{transform:scale(.92)}
+#a11yLive{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="bar"></div>
+<div id="a11yLive" aria-live="polite"></div>
+<script>
+var map=L.map('map',{zoomControl:true}).setView([36.8065,10.1815],17);
+var sat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Esri'});
+var satLbl=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,zIndex:500,attribution:'Esri'});
+var plan=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap',referrerPolicy:'origin'});
+var fond=L.layerGroup([sat,satLbl]).addTo(map);
+L.control.layers({'🛰️ Satellite':fond,'🗺️ Plan':plan},null,{position:'topleft',collapsed:false}).addTo(map);
+</script>
+<script>
+/* ===== gps-model.js — modèle GPS (acquisition + géométrie), remplace l'ancien filtre makeGpsFilter =====
+   Sections « voie ferrée / ETA / alarme train » du modèle d'origine non incluses (sans objet ici). */
+(function(){
+/* ============================================================================
+ * 1. CONSTANTES (valeurs identiques à l'application d'origine)
+ * ========================================================================== */
+
+/** Options passées à navigator.geolocation.watchPosition (index.html l.7118). */
+const GPS_WATCH_OPTIONS = Object.freeze({
+  enableHighAccuracy: true,
+  maximumAge: 2000,
+  timeout: 15000,
+});
+
+/** Rayon de danger : alarme si le train est à ≤ 150 m. */
+const ALERT_DISTANCE_M = 150;
+/** Fenêtre de temps de l'alarme : ETA estimé ≤ 3 min (et ≥ -1 min). */
+const ALERT_ETA_MAX_MIN = 3;
+const ALERT_ETA_MIN_MIN = -1;
+/** Nombre de lectures consécutives cohérentes avant de verrouiller l'alarme. */
+const LOCK_CONFIRM_READINGS = 3;
+/** Vitesse moyenne supposée d'un train pour l'interpolation temporelle. */
+const AVG_TRAIN_SPEED_KMH = 60;
+/** Écart minimal (s) entre deux lectures pour calculer approche/éloignement. */
+const APPROACH_MIN_DT_SEC = 3;
+
+const EARTH_RADIUS_M = 6371000;
+const TN_M_PER_DEG = 111320; // mètres par degré de latitude (approximation)
+const toRad = (d) => (d * Math.PI) / 180;
+const toDeg = (r) => (r * 180) / Math.PI;
+
+/* ============================================================================
+ * 2. ACQUISITION GPS
+ * ========================================================================== */
+
+/**
+ * Normalise un GeolocationPosition comme le fait onPos() :
+ *  - speed (m/s) -> km/h ; une vitesse nulle/absente vaut 0.
+ * @returns {{pos:[number,number], lat:number, lon:number, accuracy:number,
+ *            speedMps:number, speedKmh:number, timestamp:number}}
+ */
+function normalizeFix(position) {
+  const { latitude, longitude, accuracy, speed, heading } = position.coords;
+  const speedMps = speed ? speed : 0;
+  return {
+    pos: [latitude, longitude],
+    lat: latitude,
+    lon: longitude,
+    accuracy,
+    speedMps,
+    speedKmh: speedMps * 3.6,
+    heading: typeof heading === 'number' && isFinite(heading) ? heading : null,
+    timestamp: position.timestamp ?? Date.now(),
+  };
+}
+
+/**
+ * Surveillance GPS continue (équivalent de startWatch/stopWatch + onPos, sans UI).
+ *
+ * @param {object}   handlers
+ * @param {(fix:ReturnType<typeof normalizeFix>)=>void} handlers.onFix  appelé à chaque relevé
+ * @param {(err:GeolocationPositionError)=>void}        [handlers.onError]
+ * @param {Geolocation} [geo] injectable pour les tests (défaut : navigator.geolocation)
+ */
+function createGpsWatcher({ onFix, onError }, geo = globalThis.navigator?.geolocation) {
+  let watchId = null;
+  let last = null;
+  return {
+    start() {
+      if (!geo) throw new Error('Géolocalisation non supportée');
+      if (watchId !== null) return;
+      watchId = geo.watchPosition(
+        (p) => {
+          last = normalizeFix(p);
+          onFix(last);
+        },
+        (e) => onError && onError(e),
+        GPS_WATCH_OPTIONS
+      );
+    },
+    stop() {
+      if (watchId !== null && geo) geo.clearWatch(watchId);
+      watchId = null;
+    },
+    /** Dernière position connue (équivalent de la globale `lastPos`). */
+    get last() {
+      return last;
+    },
+    get active() {
+      return watchId !== null;
+    },
+  };
+}
+
+/* ============================================================================
+ * 3. GÉOMÉTRIE
+ * ========================================================================== */
+
+/** Distance sphérique (haversine) en mètres entre deux points [lat,lon]. */
+function haversine(a, b) {
+  const dLat = toRad(b[0] - a[0]);
+  const dLon = toRad(b[1] - a[1]);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLon / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.sqrt(s));
+}
+
+/**
+ * Paramètre t∈[0,1] de la projection planaire de p sur le segment [a,b].
+ * (approximation plane, valable pour de petites distances).
+ */
+function projectT(p, a, b) {
+  const ax = a[1], ay = a[0], bx = b[1], by = b[0], px = p[1], py = p[0];
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return 0;
+  const t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  return Math.max(0, Math.min(1, t));
+}
+
+/** Point situé à distM mètres de [lat,lon] dans la direction bearingDeg (formule sphérique). */
+function destinationPoint(lat, lon, bearingDeg, distM) {
+  const br = toRad(bearingDeg);
+  const lat1 = toRad(lat), lon1 = toRad(lon);
+  const d = distM / EARTH_RADIUS_M;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(br));
+  const lon2 =
+    lon1 +
+    Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
+  return [toDeg(lat2), ((toDeg(lon2) + 540) % 360) - 180];
+}
+
+/** Cap (bearing) initial de a vers b, en degrés [0,360[. */
+function bearingBetween(a, b) {
+  const y = Math.sin(toRad(b[1] - a[1])) * Math.cos(toRad(b[0]));
+  const x =
+    Math.cos(toRad(a[0])) * Math.sin(toRad(b[0])) -
+    Math.sin(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.cos(toRad(b[1] - a[1]));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+/**
+ * Métrique équirectangulaire « Tunisie » (haversineTN) : très rapide, précise à l'échelle
+ * du pays. La latitude de référence est recalibrée sur la moyenne réelle des points du réseau.
+ * @param {Array<{pts:number[][]}>} [railLines]  sert uniquement à calibrer la latitude de référence
+ * @returns {(a:number[], b:number[])=>number} distance en mètres
+ */
+function createTNMetric(railLines) {
+  let refLatRad = toRad(33.5); // valeur de repli de l'application d'origine
+  if (railLines && railLines.length) {
+    let sum = 0, n = 0;
+    for (const line of railLines) for (const p of line.pts) { sum += p[0]; n++; }
+    if (n > 0) refLatRad = toRad(sum / n);
+  }
+  const cosRef = Math.cos(refLatRad);
+  return function haversineTN(a, b) {
+    const dLat = (b[0] - a[0]) * TN_M_PER_DEG;
+    const dLon = (b[1] - a[1]) * TN_M_PER_DEG * cosRef;
+    return Math.sqrt(dLat * dLat + dLon * dLon);
+  };
+}
+
+window.GpsModel = {
+  GPS_WATCH_OPTIONS, normalizeFix, createGpsWatcher,
+  haversine, projectT, destinationPoint, bearingBetween, createTNMetric
+};
+})();
+</script>
+<script>
+/* ===== 🦯 Alerte trottoir pour personnes non voyantes =====
+   Zone VERTE  : tout ce qui est hors chaussée (valeur > 0)
+   Zone ROUGE  : la chaussée elle-même, d'un bord à l'autre, + intersections jusqu'à l'autre rive
+   Sons        : bip lent en zone verte -> de plus en plus rapide en approchant du rouge -> très rapide en zone rouge */
+(function(){
+  if(typeof map==='undefined'||typeof L==='undefined') return;
+  var GREEN_M=1.0, CELL=0.002, POOL=3, TTL=365*86400000;
+  var EP=['https://overpass-api.de/api/interpreter','https://lz4.overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.openstreetmap.fr/api/interpreter'];
+  var DEF_W={motorway:14,trunk:12,primary:10,secondary:8,tertiary:7,unclassified:6,residential:6,living_street:5,service:3.5,track:3,road:5};
+  var on=false, watchId=null, ac=null, timer=null, me=null, layers=[], pane=null, state='none', dEdge=99, first=false, cells={}, pending={}, visOn=true, hinted=false, lg=L.layerGroup(), readySaid=false, errSaid=0, onSince=0;
+
+  /* ---------- bouton ---------- */
+  var bar=document.getElementById('bar'), btn=document.createElement('button');
+  btn.id='safeBtn'; btn.type='button'; btn.textContent='🦯';
+  btn.title='Alerte trottoir / تنبيه الرصيف'; btn.setAttribute('aria-label','Alerte trottoir : désactivée'); btn.setAttribute('aria-pressed','false');
+  var satB=document.getElementById('sat'); if(bar){ if(satB&&satB.parentNode) satB.parentNode.insertBefore(btn,satB.nextSibling); else bar.appendChild(btn); } else document.body.appendChild(btn);
+  var vb=document.createElement('button'); vb.id='safeVis'; vb.type='button'; vb.textContent='🟩'; vb.title='Zones vertes/rouges'; vb.setAttribute('aria-pressed','true'); vb.setAttribute('aria-label','Zones vertes et rouges : affichées');
+  btn.parentNode.insertBefore(vb,btn.nextSibling); vb.style.outline='3px solid #fff';
+  vb.onclick=function(){ visOn=!visOn; vb.style.outline=visOn?'3px solid #fff':''; vb.setAttribute('aria-pressed',visOn?'true':'false'); vb.setAttribute('aria-label','Zones vertes et rouges : '+(visOn?'affichées':'masquées')); if(visOn){ lg.addTo(map); resize(); loadView(); } else map.removeLayer(lg); };
+  var db=document.createElement('button'); db.id='safeDl'; db.type='button'; db.textContent='📥'; db.title='Télécharger les rues autour de moi (une seule fois)'; db.setAttribute('aria-label','Télécharger les rues du quartier, une seule fois');
+  btn.parentNode.insertBefore(db,vb.nextSibling);
+  db.onclick=function(){ var c=me?{lat:me.lat,lng:me.lon}:map.getCenter(); downloadArea(c.lat,c.lng,2000); };
+  var fb=document.createElement('button'); fb.id='safeImp'; fb.type='button'; fb.textContent='📂'; fb.title='Charger un fichier de rues (Geofabrik)'; fb.setAttribute('aria-label','Charger un fichier de rues Geofabrik');
+  var fi=document.createElement('input'); fi.type='file'; fi.accept='.json,application/json'; fi.style.display='none'; document.body.appendChild(fi);
+  db.parentNode.insertBefore(fb,db.nextSibling); fb.onclick=function(){ fi.click(); }; db.style.setProperty('display','none','important'); fb.style.setProperty('display','none','important');
+  function importCells(cs,quiet){ var ks=Object.keys(cs);
+    return idbReady.then(function(){ ks.forEach(function(k){ cachePut(k,cs[k]); }); lg.clearLayers(); layers=[]; cells={}; loadView(); loadUser(); say('✅ '+ks.length+' zones chargées (hors ligne)',6000); speak(ks.length+' zones chargées. Fonctionne hors ligne.'); }); }
+  fi.onchange=function(){ var f=fi.files[0]; if(!f) return; say('📂 Lecture du fichier…',4000);
+    f.text().then(function(t){ return importCells(JSON.parse(t).cells||{}); })
+    .catch(function(){ say('⚠️ Fichier invalide',5000); }); fi.value=''; };
+  /* chargement automatique de rues.json (placé à côté de cette page sur le site) : une seule fois, puis seulement si le fichier a changé */
+  setTimeout(function(){
+    var KEYV='safeRuesV';
+    fetch('rues.json',{method:'HEAD',cache:'no-cache'}).then(function(r){ if(!r.ok) throw 0;
+      var v=(r.headers.get('etag')||'')+'|'+(r.headers.get('last-modified')||'')+'|'+(r.headers.get('content-length')||''), old=null;
+      try{ old=localStorage.getItem(KEYV); }catch(e){}
+      if(old===v) return;
+      say('📥 Chargement des rues…',60000); speak('Chargement des rues. Veuillez patienter.');
+      return fetch('rues.json',{cache:'no-cache'}).then(function(r2){ if(!r2.ok) throw 0; return r2.json(); })
+        .then(function(j){ return importCells(j.cells||{},true); })
+        .then(function(){ try{ localStorage.setItem(KEYV,v); }catch(e){} });
+    }).catch(function(){ /* hors ligne ou pas de rues.json : on garde ce qui est déjà en mémoire */ });
+  },800);
+  var lb=document.createElement('button'); lb.id='safeLoc'; lb.type='button'; lb.textContent='📍'; lb.title='Ma position / موقعي'; lb.setAttribute('aria-label','Centrer la carte sur ma position');
+  btn.parentNode.insertBefore(lb,btn.nextSibling);
+  lb.onclick=function(){ startGeo(); if(!me){ say('📍 Position GPS pas encore trouvée — autorisez la localisation et attendez',4000); speak('Position pas encore trouvée'); return; }
+    var q=pos(); follow=true; map.setView([q.lat,q.lon],Math.max(map.getZoom(),18)); say('📍 '+q.lat.toFixed(5)+', '+q.lon.toFixed(5)+' · précision ±'+Math.round(me.est||rawAcc)+' m',5000); speak('Position affichée. La carte vous suit.'); };
+  map.on('dragstart',function(){ follow=false; });
+  var pb=document.createElement('button'); pb.id='safePhoto'; pb.type='button'; pb.textContent='🖼️'; pb.title='Choisir la photo du point'; pb.setAttribute('aria-label','Choisir la photo affichée sur le point');
+  var pi=document.createElement('input'); pi.type='file'; pi.accept='image/*'; pi.style.display='none'; document.body.appendChild(pi);
+  lb.parentNode.insertBefore(pb,lb.nextSibling); pb.onclick=function(){ pi.click(); };
+  pi.onchange=function(){ var f=pi.files[0]; if(!f) return; var im=new Image(), u=URL.createObjectURL(f);
+    im.onload=function(){ var c=document.createElement('canvas'); var m=Math.min(im.width,im.height); c.width=c.height=64; c.getContext('2d').drawImage(im,(im.width-m)/2,(im.height-m)/2,m,m,0,0,64,64);
+      photo=c.toDataURL('image/jpeg',.8); try{ localStorage.setItem('safePhoto',photo); }catch(e){} URL.revokeObjectURL(u); if(mk) mk.setIcon(mkIcon()); say('✅ Photo enregistrée',3000); };
+    im.onerror=function(){ say('⚠️ Image illisible',3000); }; im.src=u; pi.value=''; };
+  var toast=document.createElement('div');
+  toast.style.cssText='position:fixed;left:50%;transform:translateX(-50%);top:calc(110px + env(safe-area-inset-top));z-index:3600;background:#0d1a6eF2;color:#fff;border:1px solid #d4af37;border-radius:12px;padding:8px 14px;font-size:13px;max-width:calc(100vw - 32px);text-align:center;display:none';
+  document.body.appendChild(toast); var tt=null;
+  var lastMsg='', V='v9';
+  var info_=document.createElement('div'); info_.id='safeInfo';
+  info_.style.cssText='position:fixed;left:10px;bottom:calc(10px + env(safe-area-inset-bottom));z-index:3600;background:#000c;color:#fff;font:700 12px system-ui,sans-serif;padding:6px 10px;border-radius:10px;pointer-events:none;max-width:70vw';
+  document.body.appendChild(info_);
+  function info(){ var z=map.getZoom(), n=0, ok=0, pd=Object.keys(pending).length, fl=0; for(var k in cells){ if(cells[k]&&cells[k].d){ n+=cells[k].d.ways.length; ok++; } else if(cells[k]&&cells[k].fail) fl++; }
+    info_.textContent='🦯 '+V+' · zoom '+z+' · '+n+' rues · '+ok+' zones'+(pd?' · ⏳'+pd:'')+(fl&&!pd?' · ❌ réseau':'')+(gpsErr?' · ⚠️ '+gpsErr:(!rawT?' · 📡 recherche du GPS…':''))+(stepTxt?' · '+stepTxt:'')+(dl.on?' · 📥 '+dl.done+'/'+dl.total:'')+(z<14?' · ⚠️ zoomez à 14 ou plus':'')+(me?' · '+me.lat.toFixed(5)+', '+me.lon.toFixed(5)+' · GPS ±'+Math.round(me.est||rawAcc)+' m · '+Math.round((me.spd||0)*3.6)+' km/h (max 7)':''); }
+
+  function say(t,ms){ toast.textContent=t; toast.style.display='block'; clearTimeout(tt); tt=setTimeout(function(){toast.style.display='none';},ms||3500);
+    var live=document.getElementById('a11yLive'); if(live) live.textContent=t; }
+  var lastVoice={};
+  /* soft : annonce d'état, jamais répétée dans les 12 s et jamais empilée sur une autre voix ; urgent : coupe la voix en cours (panne GPS) ; __ok : sinon la page bloque la voix */
+  function speak(t,soft,urgent){ try{ var ss=window.speechSynthesis; if(!ss) return; var now=Date.now();
+    if(soft){ if(ss.speaking||ss.pending) return; if(lastVoice[t]&&now-lastVoice[t]<12000) return; lastVoice[t]=now; }
+    if(urgent) ss.cancel();
+    var u=new SpeechSynthesisUtterance(t); u.__ok=true; u.lang='fr-FR'; ss.speak(u); }catch(e){} }
+
+  /* ---------- géométrie (mètres, repère local autour du centre de chargement) ---------- */
+  function proj(c,la,lo){ return {x:(lo-c.lon)*111320*Math.cos(c.lat*Math.PI/180), y:(la-c.lat)*111320}; }
+  function ptSeg(px,py,a,b){ var dx=b.x-a.x, dy=b.y-a.y, l=dx*dx+dy*dy, t=l?Math.max(0,Math.min(1,((px-a.x)*dx+(py-a.y)*dy)/l)):0, x=a.x+t*dx-px, y=a.y+t*dy-py; return Math.sqrt(x*x+y*y); }
+  function num(v){ var x=parseFloat(String(v||'').replace(',','.')); return x>0?x:0; }
+  function parkW(v){ return v==='parallel'?2.0 : v==='diagonal'?4.0 : v==='perpendicular'?5.0 : 0; }
+  function halfW(t){
+    var w=num(t['width:carriageway'])||num(t.width)||num(t.est_width), ow=(t.oneway==='yes'||t.oneway==='1'||t.oneway==='-1'||t.junction==='roundabout');
+    if(!w){
+      var ln=parseInt(t.lanes,10); if(ln>0) w=ln*3.0;
+      else { w=DEF_W[t.highway]||5; if(ow) w=Math.max(3,w*0.6); }
+      /* stationnement sur la chaussée : fait partie de la zone rouge */
+      var b=parkW(t['parking:lane:both']||t['parking:both']), l=b||parkW(t['parking:lane:left']||t['parking:left']), r=b||parkW(t['parking:lane:right']||t['parking:right']);
+      w+=l+r;
+    }
+    return Math.max(1.5,Math.min(w,40))/2;
+  }
+  /* distance signée au bord de chaussée : <=0 dans la chaussée (rouge), > 0 hors chaussée (vert) */
+  function signed(la,lo){
+    var ci=Math.floor(la/CELL), cj=Math.floor(lo/CELL), best=99, got=false;
+    for(var i=ci-1;i<=ci+1;i++) for(var j=cj-1;j<=cj+1;j++){
+      var c=cells[i+'_'+j]; if(!c||!c.d) continue; got=true; var d0=c.d, p=proj(d0.c,la,lo), x=p.x, y=p.y, a1,b1,w,d,q;
+      for(a1=0;a1<d0.ways.length;a1++){ w=d0.ways[a1]; for(b1=0;b1<w.pts.length-1;b1++){ d=ptSeg(x,y,w.pts[b1],w.pts[b1+1])-w.hw; if(d<best) best=d; } }
+      for(a1=0;a1<d0.junc.length;a1++){ q=d0.junc[a1]; d=Math.sqrt((x-q.x)*(x-q.x)+(y-q.y)*(y-q.y))-q.r; if(d<best) best=d; }
+    }
+    return got?best:null;
+  }
+
+
+  /* ---------- chargement des rues (OpenStreetMap / Overpass) : petites zones, en parallèle, avec mémoire ---------- */
+  var rot=0, BAD=/^(footway|path|steps|cycleway|pedestrian|corridor|bridleway|elevator|proximity|construction|raceway|platform)$/;
+  /* 2e source, autre infrastructure que Overpass : l'API principale d'OpenStreetMap (CORS ouvert) */
+  function osmApi(S,W,N,E){
+    return fetch('https://api.openstreetmap.org/api/0.6/map.json?bbox='+W+','+S+','+E+','+N,{signal:(function(){ var c=new AbortController(); setTimeout(function(){ c.abort(); },25000); return c.signal; })()})
+      .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+      .then(function(j){
+        var nm={}, out=[]; (j.elements||[]).forEach(function(e){ if(e.type==='node') nm[e.id]={lat:e.lat,lon:e.lon}; });
+        (j.elements||[]).forEach(function(e){
+          if(e.type!=='way'||!e.tags||!e.tags.highway||BAD.test(e.tags.highway)||e.tags.area==='yes'||e.tags.tunnel==='yes') return;
+          var g=[], ok=true; (e.nodes||[]).forEach(function(id){ if(nm[id]) g.push(nm[id]); else ok=false; });
+          if(ok&&g.length>1) out.push({nodes:e.nodes,geometry:g,tags:e.tags});
+        });
+        return out;
+      });
+  }
+  function ovp(q,n,bb,useApi){
+    var eps=EP; if(n){ eps=[]; for(var x=0;x<n;x++) eps.push(EP[(rot++)%EP.length]); }
+    var total=eps.length+((bb&&useApi)?1:0);
+    /* on interroge plusieurs serveurs en même temps : le premier qui répond gagne */
+    return new Promise(function(ok){
+      var cnt=0, done=false, ctls=[];
+      function win(els){ if(!done){ done=true; ctls.forEach(function(c){ try{c.abort();}catch(e){} }); ok(els); } }
+      function lose(){ if(++cnt===total&&!done) ok(null); }
+      eps.forEach(function(ep){
+        var ctl=new AbortController(); ctls.push(ctl); var to=setTimeout(function(){ ctl.abort(); },18000);
+        fetch(ep,{method:'POST',body:'data='+encodeURIComponent(q),signal:ctl.signal})
+          .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+          .then(function(j){ clearTimeout(to); if(!j||!j.elements) throw 0; win(j.elements); })
+          .catch(function(){ clearTimeout(to); lose(); });
+      });
+      if(bb&&useApi) osmApi(bb[0],bb[1],bb[2],bb[3]).then(win).catch(lose);
+    });
+  }
+  function parse(els,c){
+    var ways=[], cnt={}, nodePos={}, nodeHw={};
+    els.forEach(function(e){
+      if(!e.geometry||e.geometry.length<2) return;
+      var hw=halfW(e.tags||{}), pts=e.geometry.map(function(g){return proj(c,g.lat,g.lon);});
+      ways.push({pts:pts,hw:hw,ll:e.geometry.map(function(g){return [g.lat,g.lon];})});
+      (e.nodes||[]).forEach(function(id,i){ var g=e.geometry[i]; if(!g) return;
+        cnt[id]=(cnt[id]||0)+1; nodePos[id]=g; nodeHw[id]=Math.max(nodeHw[id]||0,hw); });
+    });
+    var junc=[]; Object.keys(cnt).forEach(function(id){ if(cnt[id]>=2){ var g=nodePos[id], p=proj(c,g.lat,g.lon); junc.push({x:p.x,y:p.y,r:nodeHw[id],ll:[g.lat,g.lon]}); } });
+    return {c:c,ways:ways,junc:junc};
+  }
+  function slim(els){ return els.filter(function(e){ return e.geometry&&e.geometry.length>1; }).map(function(e){ var t=e.tags||{};
+    return {nodes:e.nodes,geometry:e.geometry.map(function(g){return {lat:+g.lat.toFixed(6),lon:+g.lon.toFixed(6)};}),tags:KEEP(t)}; }); }
+  var TK=['highway','width','width:carriageway','est_width','lanes','oneway','junction','parking:lane:both','parking:lane:left','parking:lane:right','parking:both','parking:left','parking:right'];
+  function KEEP(t){ var o={}; TK.forEach(function(k){ if(t[k]!==undefined) o[k]=t[k]; }); return o; }
+  var idb=null, mem={};
+  var idbReady=new Promise(function(res){ try{ var r=indexedDB.open('safe7',1); r.onupgradeneeded=function(){ r.result.createObjectStore('c'); }; r.onsuccess=function(){ idb=r.result; res(); }; r.onerror=function(){ res(); }; }catch(e){ res(); } });
+  function cacheGet(k){ return idbReady.then(function(){ return new Promise(function(res){ if(!idb) return res(mem[k]||null);
+    try{ var q=idb.transaction('c').objectStore('c').get(k); q.onsuccess=function(){ var v=q.result; res(v&&Date.now()-v.t<TTL?v.e:null); }; q.onerror=function(){ res(null); }; }catch(e){ res(null); } }); }); }
+  function cachePut(k,els){ var e=slim(els); if(!idb){ mem[k]=e; return; } try{ idb.transaction('c','readwrite').objectStore('c').put({t:Date.now(),e:e},k); }catch(x){} }
+  function qCell(S,W,N,E){ return '[out:json][timeout:20];way["highway"]["highway"!~"footway|path|steps|cycleway|pedestrian|corridor|bridleway|elevator|proximity|construction|raceway|platform"]["area"!="yes"]["tunnel"!="yes"]('+S+','+W+','+N+','+E+');out geom tags;'; }
+
+  /* ---------- dessin : vert (hors chaussée) puis rouge (chaussée), comme les traits bleus Street View ---------- */
+  function mkStyleG(w){ return {color:'#00e060',opacity:.95,weight:w,lineCap:'round',lineJoin:'round',pane:'safePane',interactive:false}; }
+  function mkStyleR(w){ return {color:'#ff1a1a',opacity:.95,weight:w,lineCap:'round',lineJoin:'round',pane:'safePane',interactive:false}; }
+  function ensurePane(){ if(!pane){ pane=map.createPane('safePane'); pane.style.zIndex=470; pane.style.pointerEvents='none'; lg.addTo(map); } }
+  function mpp(){ return 156543.03392*Math.cos(map.getCenter().lat*Math.PI/180)/Math.pow(2,map.getZoom()); }
+  function resize(){ var m=mpp(); layers.forEach(function(o){ o.l.setStyle({weight:Math.max(o.red?3:6,o.m/m)}); }); }
+  function drawCell(d){
+    ensurePane(); var m=mpp(), i;
+    /* vert partout hors chaussée : toute la cellule chargée est verte, le rouge (chaussée) est dessiné par-dessus */
+    lg.addLayer(L.rectangle([[d.c.lat-CELL/2,d.c.lon-CELL/2],[d.c.lat+CELL/2,d.c.lon+CELL/2]],{stroke:false,fillColor:'#00e060',fillOpacity:.5,pane:'safePane',interactive:false}));
+    for(i=0;i<d.ways.length;i++){ var w2=d.ways[i], m2=2*w2.hw, l2=L.polyline(w2.ll,mkStyleR(Math.max(3,m2/m))); lg.addLayer(l2); layers.push({l:l2,m:m2,red:1}); }
+    for(i=0;i<d.junc.length;i++){ var j2=d.junc[i]; lg.addLayer(L.circle(j2.ll,{radius:j2.r,stroke:false,fillColor:'#ff1a1a',fillOpacity:.95,pane:'safePane',interactive:false})); }
+  }
+  function setCell(i,j,els,fromCache){
+    var k=i+'_'+j, S=i*CELL, W=j*CELL, d=parse(els,{lat:S+CELL/2,lon:W+CELL/2});
+    cells[k]={d:d}; if(!fromCache) cachePut(k,els); drawCell(d);
+  }
+  function loadCell(i,j){
+    var k=i+'_'+j; if(cells[k]&&cells[k].d) return Promise.resolve(); if(pending[k]) return Promise.resolve();
+    if(cells[k]&&cells[k].fail&&Date.now()-cells[k].fail<8000) return Promise.resolve();
+    pending[k]=1; info();
+    return cacheGet(k).then(function(c){
+      if(c){ delete pending[k]; setCell(i,j,c,true); info(); checkReady(); return; }
+      var S=i*CELL, W=j*CELL;
+      return ovp(qCell(S,W,S+CELL,W+CELL),0,[S,W,S+CELL,W+CELL],true).then(function(els){
+        delete pending[k];
+        if(!els){ cells[k]={fail:Date.now()}; } else setCell(i,j,els,false);
+        info(); checkReady();
+      });
+    });
+  }
+  function runPool(list){
+    var idx=0; function next(){ if(idx>=list.length) return Promise.resolve(); var t=list[idx++]; return loadCell(t[0],t[1]).then(next); }
+    for(var w=0;w<POOL;w++) next();
+  }
+  /* ---------- 📥 téléchargement unique d'un quartier (ensuite : plus besoin d'Internet) ---------- */
+  var dl={on:false,total:0,done:0,stop:false};
+  function fetchStore(i,j,att){
+    var k=i+'_'+j;
+    return cacheGet(k).then(function(c){ if(c) return true;
+      var S=i*CELL, W=j*CELL; return ovp(qCell(S,W,S+CELL,W+CELL),2,[S,W,S+CELL,W+CELL],(att||0)>=2).then(function(els){ if(!els) return false; cachePut(k,els); return true; }); });
+  }
+  function downloadArea(la,lo,radM){
+    if(dl.on){ dl.stop=true; say('📥 Téléchargement arrêté',2500); return; }
+    var dLat=radM/111320, dLon=radM/(111320*Math.cos(la*Math.PI/180)), list=[];
+    for(var i=Math.floor((la-dLat)/CELL);i<=Math.floor((la+dLat)/CELL);i++) for(var j=Math.floor((lo-dLon)/CELL);j<=Math.floor((lo+dLon)/CELL);j++){
+      var cla=(i+.5)*CELL, clo=(j+.5)*CELL; list.push([i,j,ptDist(la,lo,cla,clo)]); }
+    list.sort(function(a,b){return a[2]-b[2];});
+    dl={on:true,total:list.length,done:0,stop:false}; var idx=0, tries={}, myDl=dl;
+    say('📥 Téléchargement des rues ('+list.length+' zones, environ '+Math.round(radM/1000*10)/10+' km autour). Gardez l\'application ouverte.',6000);
+    speak('Téléchargement des rues. Gardez l\'application ouverte.');
+    function worker(){
+      if(myDl.stop||idx>=list.length) return Promise.resolve();
+      var t=list[idx++];
+      return fetchStore(t[0],t[1],tries[t[0]+'_'+t[1]]||0).then(function(ok){
+        if(ok){ myDl.done++; info(); return worker(); }
+        var n=tries[t[0]+'_'+t[1]]=(tries[t[0]+'_'+t[1]]||0)+1;
+        if(n<6){ list.push(t); }  /* on réessaie plus tard */
+        else { myDl.done++; }
+        return new Promise(function(r){ setTimeout(r,3000); }).then(worker);
+      });
+    }
+    var ws=[]; for(var w=0;w<POOL;w++) ws.push(worker());
+    Promise.all(ws).then(function(){
+      myDl.on=false; info();
+      if(myDl.stop) return;
+      say('✅ Rues téléchargées : l\'alerte fonctionne maintenant sans Internet',6000); speak('Rues téléchargées. L\'alerte fonctionne maintenant sans Internet.');
+      loadView(); if(on) loadUser();
+    });
+  }
+  function around(la,lo,rad){ var ci=Math.floor(la/CELL), cj=Math.floor(lo/CELL), out=[]; for(var i=ci-rad;i<=ci+rad;i++) for(var j=cj-rad;j<=cj+rad;j++) out.push([i,j,Math.abs(i-ci)+Math.abs(j-cj)]); return out; }
+  function loadView(){
+    if(!visOn) return;
+    var z=map.getZoom();
+    if(z<14){ if(!hinted){ hinted=true; say('🔍 Zoomez (niveau 14 ou plus) pour voir les zones 🟢 vertes et 🔴 rouges',6000); } return; }
+    var b=map.getBounds(), c=map.getCenter(), cc=Math.floor(c.lat/CELL), cj=Math.floor(c.lng/CELL), list=[];
+    for(var i=Math.floor(b.getSouth()/CELL);i<=Math.floor(b.getNorth()/CELL);i++) for(var j=Math.floor(b.getWest()/CELL);j<=Math.floor(b.getEast()/CELL);j++) list.push([i,j,Math.abs(i-cc)+Math.abs(j-cj)]);
+    list.sort(function(a,b2){return a[2]-b2[2];}); runPool(list.slice(0,12));
+  }
+  function loadUser(){ if(!me) return; var l=around(me.lat,me.lon,1); l.sort(function(a,b2){return a[2]-b2[2];}); runPool(l); }
+  map.on('zoomend moveend',function(){ info(); if(visOn){ resize(); loadView(); } });
+  setInterval(function(){ if(visOn) loadView(); if(on){ loadUser(); evalPos(); } info(); checkReady(); },6000);
+  setInterval(function(){ if(on){ evalPos(); stepsMsg(); info(); } },400);
+  setTimeout(function(){ info(); loadView(); },800);
+
+  /* ---------- position ---------- */
+  function ptDist(a,b,c,d){ return GpsModel.haversine([a,b],[c,d]); }   /* distance (m) : haversine du modèle GPS */
+  var gps=GpsModel.createGpsWatcher({onFix:function(f){ onPos(f); },onError:function(e){ onErr(e); }}), rawAcc=99, rawT=0, accBad=false, faultSince=0, want='none', wantSince=0, lastVib=0, ka=null, wl=null, lastTick=0, lastWarnB=0;
+  var buf=[], circ=null, mk=null, follow=false, MAXV=2.0, lastSlow=0, gpsErr='';   /* 2 m/s = 7 km/h : au-delà, le GPS ne suit plus bien */
+  /* un seul petit point (22 px) : la photo choisie par l'utilisateur (bouton 🖼️), sinon une petite personne avec canne */
+  var photo=null; try{ photo=localStorage.getItem('safePhoto'); }catch(e){}
+  var DEF='<svg viewBox="7 3 24 31" style="width:100%;height:100%"><g stroke="#fff" stroke-linecap="round" fill="none"><circle cx="17" cy="9" r="3.2" fill="#fff" stroke="none"/><path stroke-width="3" d="M17 14.5V23M17 23L13.5 30M17 23L20.5 30"/><path stroke-width="2.4" d="M17 17.5L24 19.5M24 19.5L30 31"/></g></svg>';
+  function mkIcon(){ var inner=photo?'<div style="width:100%;height:100%;background:url('+photo+') center/cover"></div>':DEF;
+    return L.divIcon({className:'',iconSize:[22,22],iconAnchor:[11,11],html:'<div style="width:22px;height:22px;box-sizing:border-box;border-radius:50%;border:2px solid #fff;background:#1e90ff;box-shadow:0 0 3px #000a;overflow:hidden">'+inner+'</div>'}); }
+  function showMk(la,lo,r){
+    if(!mk) mk=L.marker([la,lo],{icon:mkIcon(),interactive:false,keyboard:false,zIndexOffset:1000}).addTo(map); else mk.setLatLng([la,lo]);
+  }
+  /* le GPS démarre dès l'ouverture de la page : la position s'affiche sans rien activer */
+  function startGeo(){
+    if(gps.active) return;
+    if(!navigator.geolocation){ gpsErr='géolocalisation non supportée'; say('⚠️ Géolocalisation non supportée par ce navigateur',6000); return; }
+    if(window.isSecureContext===false){ gpsErr='page non sécurisée (https requis)'; say('⚠️ Le GPS exige une page en https (ou le fichier ouvert directement)',7000); }
+    if(window.self!==window.top) say('⚠️ Ouvrez la page directement dans le navigateur (pas dans un aperçu intégré) : le GPS y est bloqué',8000);
+    gps.start();   /* watchPosition avec GPS_WATCH_OPTIONS du modèle */
+  }
+  function onPos(fix){   /* fix = GpsModel.normalizeFix(position) : {lat,lon,accuracy,speedMps,heading,timestamp} */
+    rawAcc=fix.accuracy||99; rawT=Date.now(); gpsErr='';
+    if(!me){ showMk(fix.lat,fix.lon,rawAcc); if(!first){ first=true; map.setView([fix.lat,fix.lon],Math.max(map.getZoom(),18)); } }   /* point bleu immédiat */
+    var f={lat:fix.lat,lon:fix.lon,est:rawAcc};
+    /* 3 lectures GPS en 3 s : on confirme l'endroit et on utilise le CENTRE du cercle formé par les points */
+    var now=Date.now(); buf.push({lat:f.lat,lon:f.lon,t:now}); buf=buf.filter(function(q){ return now-q.t<=3500; }).slice(-3);
+    var n=buf.length; if(n<3&&me&&now-me.t<6000) return;      /* on attend la 3e lecture (sauf au démarrage ou si le GPS est lent) */
+    var cl=0,co=0,tm=0; buf.forEach(function(q){ cl+=q.lat; co+=q.lon; tm+=q.t; }); cl/=n; co/=n; tm/=n;
+    var rad=0; buf.forEach(function(q){ rad=Math.max(rad,ptDist(cl,co,q.lat,q.lon)); });
+    if(n>=3&&rad>Math.max(10,2*rawAcc)){ buf=buf.slice(-1); return; }      /* lectures qui ne concordent pas : position non confirmée */
+    var est=Math.max(rad,f.est||0);
+    /* vitesse de la personne : GPS (vitesse + cap) si dispo, sinon déplacement entre la 1re et la dernière lecture */
+    var K=111320, ck=Math.cos(cl*Math.PI/180), vx=0, vy=0, sp=fix.speedMps, hd=fix.heading;
+    if(hd!==null&&sp>0){ vx=sp*Math.sin(hd*Math.PI/180); vy=sp*Math.cos(hd*Math.PI/180); }
+    else if(n>=2){ var dtv=(buf[n-1].t-buf[0].t)/1000; if(dtv>0.5){ vx=(buf[n-1].lon-buf[0].lon)*K*ck/dtv; vy=(buf[n-1].lat-buf[0].lat)*K/dtv; } }
+    var spd=Math.sqrt(vx*vx+vy*vy); if(spd<0.6) vx=vy=0; else if(spd>3){ vx*=3/spd; vy*=3/spd; }   /* immobile = pas de dérive ; max 3 m/s */
+    me={lat:cl,lon:co,acc:rawAcc,est:est,t:now,tm:tm,vx:vx,vy:vy,spd:spd};
+    if(on&&spd>MAXV&&now-lastSlow>6000){ lastSlow=now; speak('Ralentissez un peu'); say('🐢 Ralentissez un peu — vitesse maximale 7 km/h',3500); }
+    showMk(cl,co,est);
+    if(!first){ first=true; map.setView([me.lat,me.lon],Math.max(map.getZoom(),18)); }
+    loadUser(); evalPos();
+  }
+  function onErr(e){ var c=e&&e.code; gpsErr=c===1?'localisation refusée':c===3?'pas de signal GPS':'GPS indisponible';
+    say(c===1?'⚠️ Autorisez la localisation dans le navigateur / فعّل إذن الموقع':c===3?'⚠️ Pas de signal GPS : sortez à découvert':'⚠️ Position indisponible',6000); }
+  setTimeout(startGeo,300);
+
+  function checkReady(){
+    if(!on||!me) return;
+    var c=cells[Math.floor(me.lat/CELL)+'_'+Math.floor(me.lon/CELL)];
+    if(c&&c.d){ if(!readySaid){ readySaid=true; var n=0; for(var k in cells){ if(cells[k]&&cells[k].d) n+=cells[k].d.ways.length; } speak(n?('Alerte prête. '+n+' rues autour de vous.'):'Aucune rue trouvée autour de vous.'); } }
+    else if(Date.now()-onSince>25000&&Date.now()-errSaid>30000){ errSaid=Date.now(); speak('Attention. Les rues ne sont pas encore chargées. Alerte indisponible.'); }
+  }
+  var faultWhy='', faultT=0;
+  function fault(){
+    if(!me&&!rawT) return 'Position GPS introuvable';
+    if(Date.now()-rawT>10000) return me?'Position GPS perdue':'Position GPS introuvable';
+    if(rawAcc>25) accBad=true; else if(rawAcc<15) accBad=false;   /* hystérésis : pas de va-et-vient autour du seuil */
+    if(accBad) return 'GPS imprécis';
+    if(!me||Date.now()-me.t>10000) return 'Position GPS perdue';
+    if(signed(me.lat,me.lon)===null) return 'Rues non chargées';
+    return '';
+  }
+  /* position « maintenant » : centre des 3 lectures avancé à la vitesse de la personne (rattrape le retard de la moyenne et avance entre deux fixes, 2,5 s max) */
+  function pos(){ var dt=Math.min(2.5,Math.max(0,(Date.now()-me.tm)/1000)), K=111320;
+    return {lat:me.lat+me.vy*dt/K, lon:me.lon+me.vx*dt/(K*Math.cos(me.lat*Math.PI/180))}; }
+  /* ---------- nombre de pas avant l'autre zone, dans le sens de la marche ---------- */
+  var STEP=0.7, lastN=-1, lastS='', lastT=0, stepTxt='';   /* STEP = longueur d'un pas en mètres (à régler selon la personne) */
+  var HD=['devant','devant à droite','à droite','derrière à droite','derrière','derrière à gauche','à gauche','devant à gauche'],
+      CD=['au nord','au nord-est','à l\'est','au sud-est','au sud','au sud-ouest','à l\'ouest','au nord-ouest'], lastHead=null, lastMoveT=0;
+  function stepsMsg(){
+    stepTxt=''; if(!me||faultWhy||(state!=='green'&&state!=='red')) return;
+    var q=pos(), K=111320, ck=Math.cos(q.lat*Math.PI/180), now=Date.now(), moving=(me.spd||0)>=0.6, wantRed=(state==='green'), k, i, a, s, dist=[], best=-1;
+    if(moving){ lastHead=Math.atan2(me.vx,me.vy)*180/Math.PI; lastMoveT=now; }
+    var rel=(lastHead!==null&&now-lastMoveT<2000), base=rel?lastHead:0;      /* en marche : devant/gauche/droite ; à l'arrêt : points cardinaux */
+    for(k=0;k<8;k++){ a=(base+k*45)*Math.PI/180; var ux=Math.sin(a), uy=Math.cos(a); dist[k]=null;
+      for(i=1;i<=20;i++){ var d=i*0.3; s=signed(q.lat+uy*d/K,q.lon+ux*d/(K*ck)); if(s===null) break; if(wantRed?s<=-0.3:s>0.6){ dist[k]=d; break; } }
+      if(dist[k]!==null&&(best<0||dist[k]<dist[best])) best=k; }
+    var dir, dd;
+    if(best<0){ if(wantRed) return; dd=0.6-dEdge; dir=''; }                                   /* rien à moins de 6 m dans les 8 directions */
+    else { if(rel&&dist[0]!==null&&dist[0]<=dist[best]+0.7) best=0; dd=dist[best]; dir=(rel?HD:CD)[best]; }
+    if(wantRed) dd=Math.max(0,dd-Math.min(1,(me.est||0)*0.3));                                 /* prudence : danger annoncé un peu plus tôt */
+    var n=Math.max(1,Math.round(dd/STEP)); if(n>(wantRed?8:12)) return;
+    var txt=(wantRed?'Danger ':'Trottoir ')+(dir?dir+', ':'')+n+' pas'; stepTxt=txt;
+    if((txt!==lastS&&now-lastT>1200)||now-lastT>5000){ lastS=txt; lastT=now; speak(txt,false,true); }
+  }
+  function evalPos(){
+    if(!me){ state='none'; return; }
+    var q=pos(); 
+    if(mk) mk.setLatLng([q.lat,q.lon]);
+    if(follow) map.setView([q.lat,q.lon],map.getZoom(),{animate:false}); var s=signed(q.lat,q.lon); if(s===null){ state='none'; return; } dEdge=s;
+    /* hystérésis : on ne change de zone que si la position s'éloigne nettement du seuil, et que ça dure */
+    var raw;
+    /* valeur > 0 = zone verte (partout hors chaussée, sans limite de 1 m) ; chaussée = rouge */
+    if(state==='red') raw= s<=0.6?'red' : 'green';
+    else raw= s<=-0.3?'red' : 'green';
+    var now=Date.now(); if(raw!==want){ want=raw; wantSince=now; }
+    if(raw===state||now-wantSince<(raw==='red'?400:1000)) return;
+    var ns=raw;
+    if(ns==='green'&&state==='none') speak('Bord de rue',true);
+    if(ns==='none'&&state!=='none') speak('Zone sûre',true);
+    state=ns;
+    if(ns==='red'&&navigator.vibrate&&now-lastVib>3000){ lastVib=now; try{navigator.vibrate([120,60,120]);}catch(e){} }
+  }
+  
+  /* ---------- sons ---------- */
+  function resumeAudio(){ try{ if(ac&&ac.state!=='running') ac.resume(); }catch(e){} }
+  function beep(freq,dur){
+    if(!ac) return; try{
+      resumeAudio();
+      var o=ac.createOscillator(), g=ac.createGain(), t=ac.currentTime+0.01;
+      o.type='sine'; o.frequency.value=freq; o.connect(g); g.connect(ac.destination);
+      g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.6,t+0.008); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+      o.start(t); o.stop(t+dur+0.02);
+    }catch(e){}
+  }
+  /* tonalité inaudible (30 Hz, quasi nulle) : empêche le navigateur de suspendre l'audio et de ralentir les minuteurs */
+  function keepAlive(){ try{ if(ka||!ac) return; ka=ac.createOscillator(); var g=ac.createGain(); ka.frequency.value=30; g.gain.value=0.003; ka.connect(g); g.connect(ac.destination); ka.start(); }catch(e){ ka=null; } }
+  function wakeOn(){ try{ if(on&&!wl&&navigator.wakeLock) navigator.wakeLock.request('screen').then(function(l){ wl=l; l.addEventListener('release',function(){ wl=null; }); }).catch(function(){}); }catch(e){} }
+  function wakeOff(){ try{ if(wl){ wl.release(); wl=null; } }catch(e){} }
+  /* LES BIPS NE S'ARRÊTENT JAMAIS : zone sûre = bip lent · bord de rue = bip de plus en plus rapide · chaussée = bip très rapide */
+  function tick(){
+    if(!on) return; lastTick=Date.now(); var next=1200;
+    try{
+      var fw=fault();
+      if(fw){ if(!faultSince) faultSince=Date.now(); if(Date.now()-faultSince<3000&&fw!=='Position GPS introuvable') fw=''; } else faultSince=0;
+      if(fw){ if(fw!==faultWhy||Date.now()-faultT>15000){ faultWhy=fw; faultT=Date.now(); speak('Attention. '+fw+'. Ne vous fiez pas à l\'alerte.',false,true); } }
+      else if(faultWhy){ faultWhy=''; speak('Alerte de nouveau fiable'); }
+      if(fw&&fw!=='GPS imprécis'){ beep(220,0.35); next=1500; }       /* GPS perdu / rues absentes : bip GRAVE */
+      else {
+        if(fw&&Date.now()-lastWarnB>4000){ lastWarnB=Date.now(); beep(220,0.25); }   /* GPS imprécis : avertissement grave AJOUTÉ, les bips continuent */
+        if(state==='green'){ var G=Math.max(GREEN_M,Math.min(6,(me&&me.est)||GREEN_M)), f=1-Math.max(0,Math.min(1,dEdge/G)); beep(600+300*f,0.09); next=1000-700*f; }
+        else if(state==='red'){ beep(1500,0.05); next=100; }
+        else { beep(500,0.06); next=1200; }
+      }
+    }catch(e){ next=500; }
+    timer=setTimeout(tick,next);
+  }
+  /* garde-fou : si le navigateur a endormi l'audio ou la boucle des bips, on les relance */
+  setInterval(function(){ if(!on) return; resumeAudio(); wakeOn(); if(Date.now()-lastTick>3500){ clearTimeout(timer); tick(); } },1500);
+  document.addEventListener('visibilitychange',function(){ if(!on) return; resumeAudio(); wakeOn(); if(Date.now()-lastTick>2500){ clearTimeout(timer); tick(); } });
+
+  /* ---------- activation ---------- */
+  function setOn(v){
+    on=v; btn.setAttribute('aria-pressed',v?'true':'false'); btn.style.outline=v?'3px solid #fff':'';
+    btn.setAttribute('aria-label','Alerte trottoir : '+(v?'activée':'désactivée'));
+    if(v){
+      try{ if(navigator.audioSession) navigator.audioSession.type='playback'; }catch(e){}
+      try{ ac=ac||new (window.AudioContext||window.webkitAudioContext)(); ac.onstatechange=function(){ if(on) resumeAudio(); }; resumeAudio(); keepAlive(); }catch(e){}
+      wakeOn();
+      if(!navigator.geolocation){ say('⚠️ Géolocalisation non supportée',4000); return; }
+      onSince=Date.now(); readySaid=false; errSaid=0;
+      startGeo();
+      say('🦯 Alerte activée — 🟢 bip lent : hors chaussée — 🔴 bip rapide : chaussée',5000); speak('Alerte trottoir activée. Vitesse maximale : 7 kilomètres par heure. Marchez à pied, pas trop vite.');
+      clearTimeout(timer); tick(); if(me){ map.setView([me.lat,me.lon],Math.max(map.getZoom(),18)); loadUser(); }
+    } else {
+      clearTimeout(timer); state='none'; wakeOff(); try{ if(ka){ ka.stop(); ka=null; } }catch(e){} say('🦯 Alerte désactivée',2500); speak('Alerte trottoir désactivée');
+    }
+  }
+  btn.onclick=function(){ setOn(!on); };
+  window.safeZones={signed:signed,state:function(){return state;}};
+})();
+</script>
+</body>
+</html>
